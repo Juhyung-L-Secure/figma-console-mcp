@@ -213,6 +213,8 @@ export class FigmaWebSocketServer extends EventEmitter {
   private clients: Map<string, ClientConnection> = new Map();
   /** Clients awaiting FILE_INFO identification, mapped to their pending timeout */
   private _pendingClients: Map<WebSocket, ReturnType<typeof setTimeout>> = new Map();
+  /** Short-lived local clients that issue exporter control requests */
+  private controlClients: Set<WebSocket> = new Set();
   /** The fileKey of the currently active (targeted) file */
   private _activeFileKey: string | null = null;
   /**
@@ -444,6 +446,8 @@ export class FigmaWebSocketServer extends EventEmitter {
    * Handle incoming message from a plugin UI WebSocket connection
    */
   private handleMessage(message: any, ws: WebSocket): void {
+    if (this.handleControlMessage(message, ws)) return;
+
     // Response to a command we sent
     if (message.id && this.pendingRequests.has(message.id)) {
       const pending = this.pendingRequests.get(message.id)!;
@@ -586,6 +590,53 @@ export class FigmaWebSocketServer extends EventEmitter {
     }
 
     logger.debug({ message }, 'Unhandled WebSocket message');
+  }
+
+  /**
+   * Serve direct local requests from figma-to-code without treating that
+   * short-lived socket as another Figma file.
+   */
+  private handleControlMessage(message: any, ws: WebSocket): boolean {
+    if (!message.id || (message.type !== 'CONTROL_STATUS' && message.type !== 'CONTROL_EXECUTE_CODE')) {
+      return false;
+    }
+
+    this.registerControlClient(ws);
+
+    if (message.type === 'CONTROL_STATUS') {
+      this.sendControlResult(ws, message.id, { connected: this.isClientConnected() });
+      return true;
+    }
+
+    const params = message.params as { code: string; timeout: number };
+    this.sendCommand('EXECUTE_CODE', params, params.timeout + 2000)
+      .then((result) => this.sendControlResult(ws, message.id, result))
+      .catch((error) => this.sendControlError(ws, message.id, error));
+    return true;
+  }
+
+  private registerControlClient(ws: WebSocket): void {
+    const pendingTimeout = this._pendingClients.get(ws);
+    if (pendingTimeout) {
+      clearTimeout(pendingTimeout);
+      this._pendingClients.delete(ws);
+    }
+    this.controlClients.add(ws);
+  }
+
+  private sendControlResult(ws: WebSocket, id: string, result: unknown): void {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ id, result }));
+    }
+  }
+
+  private sendControlError(ws: WebSocket, id: string, error: unknown): void {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        id,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
   }
 
   /**
@@ -736,6 +787,8 @@ export class FigmaWebSocketServer extends EventEmitter {
    * Starts a grace period before removing the client to allow reconnection.
    */
   private handleClientDisconnect(ws: WebSocket, code: number, reason: string): void {
+    if (this.controlClients.delete(ws)) return;
+
     // Check if it was a pending client (never identified itself)
     const pendingTimeout = this._pendingClients.get(ws);
     if (pendingTimeout) {
@@ -1215,6 +1268,7 @@ export class FigmaWebSocketServer extends EventEmitter {
       clearTimeout(timeout);
     }
     this._pendingClients.clear();
+    this.controlClients.clear();
 
     this.rejectPendingRequests('WebSocket server shutting down');
 

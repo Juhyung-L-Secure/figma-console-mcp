@@ -51,6 +51,32 @@ function connectRawClient(port: number): Promise<WebSocket> {
   });
 }
 
+function controlRequest(
+  ws: WebSocket,
+  type: 'CONTROL_STATUS' | 'CONTROL_EXECUTE_CODE',
+  params: Record<string, unknown> = {}
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const id = `control_${Date.now()}`;
+    const timeout = setTimeout(() => {
+      ws.off('message', onMessage);
+      reject(new Error(`${type} timed out`));
+    }, 500);
+    const onMessage = (data: Buffer) => {
+      const message = JSON.parse(data.toString());
+      if (message.id !== id) return;
+
+      clearTimeout(timeout);
+      ws.off('message', onMessage);
+      if (message.error) reject(new Error(message.error));
+      else resolve(message.result);
+    };
+
+    ws.on('message', onMessage);
+    ws.send(JSON.stringify({ id, type, params }));
+  });
+}
+
 /** Helper: close a WebSocket client safely */
 function closeClient(ws: WebSocket | null): Promise<void> {
   if (!ws) return Promise.resolve();
@@ -446,6 +472,49 @@ describe('FigmaWebSocketServer', () => {
       expect(server.getActiveFileKey()).toBe('file-a');
       expect(server.isTargetLocked()).toBe(true);
     }, 10000);
+  });
+
+  describe('control protocol', () => {
+    test('reports whether a Desktop Bridge plugin is connected', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT });
+      await server.start();
+
+      const plugin = await connectClient(server, TEST_PORT);
+      const control = await connectRawClient(TEST_PORT);
+      clients.push(plugin, control);
+
+      await expect(controlRequest(control, 'CONTROL_STATUS')).resolves.toEqual({
+        connected: true,
+      });
+    });
+
+    test('forwards code execution to the active Desktop Bridge plugin', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT });
+      await server.start();
+
+      const plugin = await connectClient(server, TEST_PORT);
+      const control = await connectRawClient(TEST_PORT);
+      clients.push(plugin, control);
+
+      plugin.on('message', (data: Buffer) => {
+        const message = JSON.parse(data.toString());
+        if (message.method !== 'EXECUTE_CODE') return;
+        plugin.send(JSON.stringify({
+          id: message.id,
+          result: { success: true, result: '{"page":"Login/Signup_2"}' },
+        }));
+      });
+
+      await expect(
+        controlRequest(control, 'CONTROL_EXECUTE_CODE', {
+          code: 'return "ok"',
+          timeout: 1000,
+        })
+      ).resolves.toEqual({
+        success: true,
+        result: '{"page":"Login/Signup_2"}',
+      });
+    });
   });
 });
 
